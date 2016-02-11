@@ -1,9 +1,5 @@
 package App::MetaCPAN::Dash;
 
-use 5.006;
-use strict;
-use warnings;
-
 =head1 NAME
 
 App::MetaCPAN::Dash - The great new App::MetaCPAN::Dash!
@@ -28,26 +24,254 @@ Perhaps a little code snippet.
     my $foo = App::MetaCPAN::Dash->new();
     ...
 
-=head1 EXPORT
-
-A list of functions that can be exported.  You can delete this section
-if you don't export anything, such as for a purely object-oriented module.
-
-=head1 SUBROUTINES/METHODS
-
-=head2 function1
-
 =cut
 
-sub function1 {
+use Moose;
+
+with 'MooseX::Runnable';
+with 'MooseX::Getopt' => {
+  getopt_conf => [],
+};
+
+use DBI;
+use MetaCPAN::Client;
+use File::Basename;
+
+has 'outputdir' => (is => 'rw',
+                    isa => 'Str',
+                    required => 0,
+                    documentation => 'Set this to the path of an existing directory to write the docset into. If this is omitted, the docset will be automatically installed into Dash.');
+
+has '_module_name' => (is => 'rw',
+                       isa => 'Str');
+
+has '_output_path' => (is => 'rw',
+                       lazy => 1,
+                       default => sub {
+                           my $self = shift;
+                           my $name = $self->_module_name;
+                           $name =~ s/:://g;
+                           $self->outputdir . "/$name.docset";
+                       });
+
+has '_base_dir' => (is => 'ro', lazy => 1, default => sub { shift->_output_path . '/Contents/Resources/Documents' });
+
+has '_dbh' => (is => 'ro',
+               lazy => 1,
+               default => sub {
+                   my $db_dir = shift->_output_path . '/Contents/Resources';
+                   system("mkdir -p $db_dir") == 0 or die; # TODO: properly
+                   DBI->connect("dbi:SQLite:dbname=$db_dir/docSet.dsidx")
+                       or die $DBI::errstr;
+               });
+
+has '_meta_cpan' => (is => 'ro',
+                     lazy => 1,
+                     default => sub {
+                         MetaCPAN::Client->new( ua_args => [ agent => __PACKAGE__ ]);
+                     });
+
+sub run {
+    my ($self) = @_;
+
+    $self->usage->die
+        unless scalar(@{$self->extra_argv}) == 1;
+
+    $self->_module_name($self->extra_argv->[0]);
+
+    my $install = 0;
+    if (!$self->outputdir) {
+        $install = 1;
+        $self->outputdir("/tmp"); #TODO properly with file::temp and cleanup
+    }
+
+    die "The output location " . $self->_output_path . " already exists, will not overwrite\n"
+        if -e $self->_output_path;
+
+    mkdir $self->_output_path
+        or die $!;
+
+    $self->create_index_db;
+
+    my ($names, $paths, $types) = $self->get_modules;
+
+    $self->store_index_data($names, $paths, $types);
+
+    $self->get_all_docs($names, $paths, $types);
+
+    $self->write_plist;
+
+    if ($install) {
+        system("open " . $self->_output_path) == 0
+            or die "Could't open in Dash: " . $self->_output_path;
+    }
 }
 
-=head2 function2
+sub write_plist {
+    my $self = shift;
 
-=cut
+    #TODO: properly
+    open my $fh, '>', $self->_base_dir . "/../../Info.plist"
+        or die $!;
 
-sub function2 {
+    my $name = $self->_module_name;
+
+    print $fh <<EOF;
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>$name</string>
+	<key>CFBundleName</key>
+	<string>$name</string>
+	<key>DocSetPlatformFamily</key>
+	<string>$name</string>
+	<key>isDashDocset</key><true/>
+    <key>isJavaScriptEnabled</key>
+    <true/>
+</dict>
+</plist>
+EOF
 }
+
+sub get_all_docs {
+    my ($self, $names, $paths, $types) = @_;
+
+    for my $i (0..$#{$names}) {
+
+        my $name = $names->[$i];
+        my $path = $paths->[$i];
+        my $type = $paths->[$i];
+
+        my $pod = eval { $self->_meta_cpan->pod($name)->html };
+
+        if ( defined($pod) && $pod !~ /^\s+$/ && $name !~ /^_.*/) {
+            $self->write_pod($name, $path, $pod);
+        } else {
+            $self->delete_from_index($name, $path, $type);
+        }
+    }
+}
+
+sub write_pod {
+    my ($self, $name, $path, $pod) = @_;
+
+    # Figure out our path depth so we can set the relative link correclty in the html
+    my @split_path = split /\//, $path;
+    my $depth = scalar @split_path;
+
+    my $dir = dirname $path;
+
+    system("mkdir -p " . $self->_base_dir . "/$dir") == 0 or die; # TODO: properly
+
+    open my $fh, '>', $self->_base_dir . "/$path"
+        or die $!;
+
+    warn "writing to " . $self->_base_dir . "/$path";
+
+    print $fh $self->munge_html($depth, $pod, $name);
+}
+
+sub munge_html {
+    my ($self, $depth, $html, $title) = @_;
+
+        my $path = '../' x $depth;
+
+    my $header = <<"HEADER";
+<html>
+<head>
+  <title>$title</title>
+  <link rel="stylesheet" type="text/css" href="${path}style.css" />
+  <link rel="stylesheet" href="${path}default.min.css" />
+  <script src="${path}highlight.min.js"></script>
+</head>
+<body>
+<script>hljs.initHighlightingOnLoad();</script>
+HEADER
+
+    my $footer = <<"FOOTER";
+</body>
+</html>
+FOOTER
+
+    return $header . $html . $footer;
+}
+
+sub delete_from_index {
+    my ($self, $name, $path, $type) = @_;
+
+    $self->execute_sql(qq{
+         DELETE FROM searchIndex WHERE name = ? AND path = ? AND type = ?
+},
+                       $name,
+                       $path,
+                       $type);
+}
+
+sub get_modules {
+    my ($self) = @_;
+
+    my $parent_module = $self->_meta_cpan->module($self->_module_name)
+        or die "Failed to get module";
+    
+    my @module_list = grep { $_->{name} } @{$parent_module->module};
+
+    die "Module has no named children"
+        unless scalar(@module_list);
+
+    my (@names, @types, @paths);
+
+    for my $module (@module_list) {
+        push @names, $module->{name};
+        push @types, 'Package';
+
+        my $path = $module->{name};
+        $path =~ s!::!/!g;
+        push @paths, "$path/" . $module->{name} . ".html"
+    }
+
+    return (\@names, \@paths, \@types);
+}
+
+sub store_index_data {
+    my ($self, $names, $paths, $types) = @_;
+
+    for my $i (0..$#{$names}) {
+        $self->execute_sql(qq{
+        INSERT OR IGNORE INTO searchIndex(name, path, type) VALUES (?,?,?);
+    },
+                           $names->[$i],
+                           $paths->[$i],
+                           $types->[$i]);
+    }
+}
+
+sub create_index_db {
+    my ($self) = @_;
+
+    $self->execute_sql(q{
+        CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT);
+    });
+
+    $self->execute_sql(q{
+        CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path);
+    });
+}
+
+sub execute_sql {
+    my ($self, $sql, @params) = @_;
+
+    my $sth = $self->_dbh->prepare($sql)
+        or die "Failed to prepare sql: " . $DBI::errstr;
+
+    $sth->execute(@params)
+        or die "Failed to execute sql: " . $DBI::errstr;
+}
+
+sub _usage_format {
+    return "usage:\n\t%c %o The::Module::Name\n\noptions:";
+};
 
 =head1 AUTHOR
 
@@ -60,36 +284,6 @@ the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=App-MetaCP
 automatically be notified of progress on your bug as I make changes.
 
 
-
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc App::MetaCPAN::Dash
-
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker (report bugs here)
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=App-MetaCPAN-Dash>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/App-MetaCPAN-Dash>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MetaCPAN-Dash>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/App-MetaCPAN-Dash/>
-
-=back
 
 
 =head1 ACKNOWLEDGEMENTS
